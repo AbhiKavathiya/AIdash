@@ -152,3 +152,81 @@ def build_soc_filter_clause(column: str, value) -> str:
         rows = ", ".join(f'{{{_dax_literal(v)}}}' for v in value)
         return f"TREATAS({{{rows}}}, {col_ref})"
     return f"TREATAS({{{_dax_literal(value)}}}, {col_ref})"
+
+
+
+
+
+
+
+_LATEST_PERIOD_CACHE: Optional[Dict] = None
+
+def get_latest_loaded_period() -> Dict:
+    """
+    Queries Power BI for the latest Year/Month that actually has data in
+    'Dim Cal' (joined against the fact table), so defaults never point at
+    a not-yet-refreshed current month. Cached for the process lifetime —
+    call refresh_latest_period_cache() if you need to bust it (e.g. after
+    a known dataset refresh).
+    """
+    global _LATEST_PERIOD_CACHE
+    if _LATEST_PERIOD_CACHE is not None:
+        return _LATEST_PERIOD_CACHE
+
+    dax = """
+    EVALUATE
+    TOPN(
+        1,
+        SUMMARIZECOLUMNS(
+            'Dim Cal'[Year],
+            'Dim Cal'[Month],
+            'Dim Cal'[MonthNumber],
+            "Employees_Head_Count", [Employees_Head_Count]
+        ),
+        [Employees_Head_Count], DESC
+    )
+    """
+    # NOTE: replace 'Dim Cal'[MonthNumber] with whatever your actual
+    # sortable month-number column is called if different.
+
+    status, result = execute_soc_dax_query(dax)
+    if status == 200:
+        rows = _extract_rows(result)
+        if rows:
+            row = rows[0]
+            year_key  = next((k for k in row if k.endswith("[Year]")), None)
+            month_key = next((k for k in row if k.endswith("[Month]")), None)
+            if year_key and month_key:
+                _LATEST_PERIOD_CACHE = {
+                    "Year":  row[year_key],
+                    "Month": row[month_key],
+                }
+                print(f"[LATEST PERIOD] Using latest loaded period: {_LATEST_PERIOD_CACHE}")
+                return _LATEST_PERIOD_CACHE
+
+    # Fallback: if this query fails for any reason, fall back to today's
+    # system date (old behavior) rather than breaking every query.
+    print("[LATEST PERIOD] Could not determine latest loaded period — "
+          "falling back to system date.")
+    _LATEST_PERIOD_CACHE = {
+        "Year":  CURRENT_YEAR,
+        "Month": MONTH_NUMBER_TO_NAME[CURRENT_MONTH],
+    }
+    return _LATEST_PERIOD_CACHE
+
+
+def refresh_latest_period_cache():
+    """Call this to force re-checking the latest loaded period (e.g. at the
+    start of a new session, or after you know the dataset refreshed)."""
+    global _LATEST_PERIOD_CACHE
+    _LATEST_PERIOD_CACHE = None
+
+
+if "Year" not in filters:
+        year_match = re.search(r"\b(20\d{2})\b", question)
+        filters["Year"] = (int(year_match.group(1)) if year_match
+                           else get_latest_loaded_period()["Year"])
+
+if not suppress:
+            # Store the name string — 'Dim Cal'[Month] is a text column
+            filters["Month"] = get_latest_loaded_period()["Month"]
