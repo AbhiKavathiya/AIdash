@@ -119,3 +119,36 @@ def extract_soc_column_values(result: Dict, column_label: str) -> List:
             values.append(v)
     return values
 
+def build_soc_filter_clause(column: str, value) -> str:
+    """
+    Single filter clause.
+    - Dim Cal columns → FILTER(ALL('Dim Cal'[col]), ...) idiom
+    - Everything else → TREATAS({value}, 'Table'[col]) idiom
+    Value can be scalar or list.
+
+    IMPORTANT: numeric values must be emitted as unquoted numeric literals
+    in DAX. Quoting a numeric value (e.g. "7" instead of 7) makes DAX treat
+    it as text, which fails to match a numeric column and silently returns
+    zero rows even though the filter value itself was correct.
+    """
+    col_ref = resolve_col(column)
+
+    def _dax_literal(v):
+        if isinstance(v, bool):
+            return "TRUE" if v else "FALSE"
+        if isinstance(v, (int, float)):
+            return str(v)
+        return f'"{v}"'
+
+    # ── Date/year columns: FILTER(ALL(...)) ──────────────────────────────
+    if column in DIM_CAL_COLS:
+        if isinstance(value, (list, tuple, set)):
+            vals = ", ".join(_dax_literal(v) for v in value)
+            return f"FILTER(ALL({col_ref}), {col_ref} IN {{{vals}}})"
+        return f"FILTER(ALL({col_ref}), {col_ref} = {_dax_literal(value)})"
+
+    # ── Dimension columns: TREATAS ────────────────────────────────────────
+    if isinstance(value, (list, tuple, set)):
+        rows = ", ".join(f'{{{_dax_literal(v)}}}' for v in value)
+        return f"TREATAS({{{rows}}}, {col_ref})"
+    return f"TREATAS({{{_dax_literal(value)}}}, {col_ref})"
