@@ -135,4 +135,102 @@ def comparison_node(state: HRAnalyticsState) -> HRAnalyticsState:
 }}
 
 
+def render_comparison_dax(spec: Dict) -> str:
+    """
+    Year-over-year / trend comparisons. `entity` is optional — when absent,
+    this renders a single overall trend line with no groupby dimension
+    (e.g. "attrition rate this year vs last year").
+
+    IMPORTANT: this does NOT filter rows by direction of change (no implicit
+    "only show increases"). It always returns Current Value, Previous Value,
+    Change, and % Change for whatever the filters/entity produce. If the
+    user explicitly asks "which X increased/decreased", that's expressed via
+    spec["direction"] ("increase" | "decrease"), set below.
+    """
+    table = spec.get("table") or "Emp_Master"
+    entity = spec.get("entity")
+    measure = spec.get("measure")
+    comparison = (spec.get("comparison") or "").lower()
+    base_filters = spec.get("filters", {}) or {}
+    direction = (spec.get("direction") or "").lower()  # optional: "increase" | "decrease"
+
+    if not measure:
+        raise ValueError("Comparison queries require 'measure'")
+
+    entity_col = None
+    if entity:
+        entity_col = resolve_column(entity, table=table if table != "Emp_Master" else None)
+
+    dax_filters_no_year = build_filters(
+        {k: v for k, v in base_filters.items() if k != "Year"},
+        table=table if table != "Emp_Master" else None,
+    )
+    expr = get_measure_expression(measure)
+
+    current_years = base_filters.get("Year", [CURRENT_YEAR])
+
+    # Ensure it's always a list
+    if not isinstance(current_years, list):
+        current_years = [current_years]
+
+    # Convert all years to integers and sort in descending order
+    current_years = sorted(map(int, current_years), reverse=True)
+
+    if len(current_years) >= 2:
+        current_year = current_years[0]
+        previous_year = current_years[1]
+    else:
+        current_year = current_years[0]
+        previous_year = current_year - 1
+
+    print(f"Current Year: {current_year}")
+    print(f"Previous Year: {previous_year}")
+
+    extra = ("," + ",\n    ".join(dax_filters_no_year)) if dax_filters_no_year else ""
+
+    if "yoy" in comparison or "year over year" in comparison:
+        group_line = f"{entity_col},\n                                " if entity_col else ""
+
+        base_table = f"""ADDCOLUMNS(
+                            SUMMARIZECOLUMNS(
+                                {group_line}FILTER(ALL(DimCal[Year]), DimCal[Year] = {current_year}){extra},
+                                "Current Value", {expr},
+                                "Previous Value", CALCULATE(
+                                    {expr},
+                                    FILTER(ALL(DimCal[Year]), DimCal[Year] = {previous_year})
+                                )
+                            ),
+                            "Change", [Current Value] - [Previous Value],
+                            "% Change", DIVIDE([Current Value] - [Previous Value], [Previous Value], 0) * 100
+                        )"""
+
+        # Only restrict by direction of change if the user actually asked for that
+        # (e.g. "managers whose span increased YoY"). Default: show everything.
+        if direction == "increase":
+            dax = f"""EVALUATE
+                    FILTER(
+                        {base_table},
+                        [Change] > 0
+                    )"""
+        elif direction == "decrease":
+            dax = f"""EVALUATE
+                    FILTER(
+                        {base_table},
+                        [Change] < 0
+                    )"""
+        else:
+            dax = f"""EVALUATE
+                    {base_table}"""
+    else:
+        time_dimension = spec.get("time_dimension", "Year")
+        time_col = resolve_column(time_dimension, table="DimCal")
+        group_line = f"{entity_col},\n    " if entity_col else ""
+        dax = f"""EVALUATE
+SUMMARIZECOLUMNS(
+    {group_line}{time_col}{extra},
+    "{measure}", {expr}
+)"""
+
+    return dax.strip()
+
     
