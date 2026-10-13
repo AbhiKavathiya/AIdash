@@ -1,0 +1,625 @@
+from typing import TypedDict, Annotated, List, Dict, Optional
+from langgraph.graph import StateGraph, END
+from langchain_openai import AzureChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from unified_retrieval import UnifiedPolicyRetriever, SearchResult
+import operator
+from datetime import datetime
+import json
+
+
+# ========== State Definition ==========
+class UnifiedAgentState(TypedDict):
+    """State for the unified RAG agent"""
+    question: str
+    chat_history: Annotated[List[Dict], operator.add]
+    document_filters: Optional[Dict]  # {"types": [...], "names": [...]}
+    retrieved_documents: List[SearchResult]
+    context: str
+    answer: str
+    sources: List[Dict]
+    metadata: Dict
+    error: Optional[str]
+
+
+# ========== Unified RAG Agent Class ==========
+class UnifiedRAGAgent:
+    """
+    LangGraph-based RAG Agent for unified policy document Q&A
+    Searches across all 8 documents with optional filtering
+    """
+    
+    def __init__(
+        self,
+        search_service_endpoint: str,
+        search_api_key: str,
+        openai_api_key: str,
+        openai_endpoint: str,
+        index_name: str = "policy-index",
+        embedding_deployment: str = "text-embedding-3-large",
+        chat_deployment: str = "gpt-4",
+        temperature: float = 0.7,
+        max_tokens: int = 1500
+    ):
+        """
+        Initialize Unified RAG Agent
+        
+        Args:
+            search_service_endpoint: Azure AI Search endpoint
+            search_api_key: Azure AI Search API key
+            openai_api_key: Azure OpenAI API key
+            openai_endpoint: Azure OpenAI endpoint
+            index_name: Search index name (default: policy-index)
+            embedding_deployment: Embedding model deployment
+            chat_deployment: Chat model deployment
+            temperature: LLM temperature
+            max_tokens: Max tokens for response
+        """
+        # Initialize unified retriever
+        self.retriever = UnifiedPolicyRetriever(
+            search_service_endpoint=search_service_endpoint,
+            search_api_key=search_api_key,
+            index_name=index_name,
+            openai_api_key=openai_api_key,
+            openai_endpoint=openai_endpoint,
+            embedding_deployment=embedding_deployment
+        )
+        
+        # Initialize chat model
+        self.llm = AzureChatOpenAI(
+            api_key=openai_api_key,
+            azure_endpoint=openai_endpoint,
+            deployment_name=chat_deployment,
+            api_version="2024-02-15-preview",
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        
+        self.index_name = index_name
+        self.max_tokens = max_tokens
+        
+        # Build the graph
+        self.graph = self._build_graph()
+        
+        print(f"✓ Unified RAG Agent initialized for index: {index_name}")
+    
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph workflow"""
+        
+        workflow = StateGraph(UnifiedAgentState)
+        
+        # Add nodes
+        workflow.add_node("analyze_question", self._analyze_question)
+        workflow.add_node("retrieve_documents", self._retrieve_documents)
+        workflow.add_node("format_context", self._format_context)
+        workflow.add_node("generate_answer", self._generate_answer)
+        workflow.add_node("extract_sources", self._extract_sources)
+        workflow.add_node("handle_error", self._handle_error)
+        
+        # Set entry point
+        workflow.set_entry_point("analyze_question")
+        
+        # Add edges
+        workflow.add_edge("analyze_question", "retrieve_documents")
+        workflow.add_edge("retrieve_documents", "format_context")
+        workflow.add_edge("format_context", "generate_answer")
+        workflow.add_edge("generate_answer", "extract_sources")
+        workflow.add_edge("extract_sources", END)
+        workflow.add_edge("handle_error", END)
+        
+        return workflow.compile()
+    
+    # ========== Node Functions ==========
+    
+    def _analyze_question(self, state: UnifiedAgentState) -> UnifiedAgentState:
+        """Analyze the question and prepare for retrieval"""
+        
+        question = state["question"]
+        
+        # Add metadata
+        state["metadata"] = {
+            "timestamp": datetime.now().isoformat(),
+            "question_length": len(question),
+            "has_filters": state.get("document_filters") is not None
+        }
+        
+        return state
+    
+    def _retrieve_documents(self, state: UnifiedAgentState) -> UnifiedAgentState:
+        """Retrieve relevant documents using unified retriever"""
+        
+        try:
+            question = state["question"]
+            filters = state.get("document_filters", {})
+            
+            # Extract filters
+            document_types = filters.get("types")
+            document_names = filters.get("names")
+            
+            # Perform hybrid search
+            results = self.retriever.hybrid_search(
+                query=question,
+                top_k=10,
+                document_types=document_types,
+                document_names=document_names,
+                use_semantic_ranking=False,  # Disabled by default (requires index configuration)
+                min_score=0.5
+            )
+            
+            state["retrieved_documents"] = results
+            state["metadata"]["retrieved_count"] = len(results)
+            
+            # Log retrieval
+            if results:
+                doc_types = set(r.document_type for r in results)
+                state["metadata"]["document_types_found"] = list(doc_types)
+            
+            return state
+            
+        except Exception as e:
+            state["error"] = f"Retrieval error: {str(e)}"
+            return state
+    
+    def _format_context(self, state: UnifiedAgentState) -> UnifiedAgentState:
+        """Format retrieved documents into context"""
+        
+        try:
+            results = state["retrieved_documents"]
+            
+            if not results:
+                state["context"] = "No relevant documents found."
+                return state
+            
+            # Group by document for better organization
+            context_parts = []
+            current_doc = None
+            
+            for idx, result in enumerate(results, 1):
+                # Add document header if changed
+                if result.document_name != current_doc:
+                    current_doc = result.document_name
+                    context_parts.append(f"\n--- {result.document_name} ({result.document_type}) ---\n")
+                
+                # Add content with metadata
+                context_parts.append(f"[{idx}] {result.content}")
+                
+                if result.page_number:
+                    context_parts.append(f" [Page {result.page_number}]")
+                if result.section:
+                    context_parts.append(f" [Section: {result.section}]")
+                
+                context_parts.append("\n\n")
+            
+            state["context"] = "".join(context_parts)
+            state["metadata"]["context_length"] = len(state["context"])
+            
+            return state
+            
+        except Exception as e:
+            state["error"] = f"Context formatting error: {str(e)}"
+            return state
+    
+    def _generate_answer(self, state: UnifiedAgentState) -> UnifiedAgentState:
+        """Generate answer using LLM with retrieved context"""
+        
+        try:
+            question = state["question"]
+            context = state["context"]
+            chat_history = state.get("chat_history", [])
+            
+            # Build system message
+            system_message = SystemMessage(content="""You are a helpful assistant for policy and documentation queries.
+
+Your role:
+- Answer questions based ONLY on the provided context
+- Cite specific documents and sections when possible
+- If the context doesn't contain the answer, say so clearly
+- For FAQ questions, provide both the answer and any mitigation steps mentioned
+- Be concise but complete
+- Use bullet points for multiple items
+- Always cite your sources with document names
+
+Context provided includes documents from:
+- Product program policies (Prime, Affordable)
+- Product policies (Informal)
+- Matrices (Deviation, Credit Approval)
+- Reporting policies (CIC)
+- FAQ documents
+- Guidelines (Mitigation)
+
+Answer format:
+1. Direct answer to the question
+2. Supporting details from context
+3. Sources: [Document names]
+
+If multiple documents contain relevant information, synthesize them into a cohesive answer.""")
+            
+            # Build message history
+            messages = [system_message]
+            
+            # Add chat history (last 5 exchanges)
+            for msg in chat_history[-10:]:
+                if msg["role"] == "user":
+                    messages.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    messages.append(AIMessage(content=msg["content"]))
+            
+            # Add current question with context
+            user_message = f"""Context from relevant documents:
+
+{context}
+
+Question: {question}
+
+Please answer based on the context above."""
+            
+            messages.append(HumanMessage(content=user_message))
+            
+            # Generate response
+            response = self.llm.invoke(messages)
+            
+            state["answer"] = response.content
+            state["metadata"]["answer_length"] = len(response.content)
+            
+            return state
+            
+        except Exception as e:
+            state["error"] = f"Answer generation error: {str(e)}"
+            return state
+    
+    def _extract_sources(self, state: UnifiedAgentState) -> UnifiedAgentState:
+        """Extract and format source citations"""
+        
+        try:
+            results = state["retrieved_documents"]
+            
+            # Group sources by document
+            sources_by_doc = {}
+            for result in results:
+                doc_name = result.document_name
+                if doc_name not in sources_by_doc:
+                    sources_by_doc[doc_name] = {
+                        "document_name": doc_name,
+                        "document_type": result.document_type,
+                        "blob_name": result.blob_name,
+                        "chunks": []
+                    }
+                
+                chunk_info = {
+                    "content": result.content[:200] + "..." if len(result.content) > 200 else result.content,
+                    "score": result.score
+                }
+                
+                if result.page_number:
+                    chunk_info["page"] = result.page_number
+                if result.section:
+                    chunk_info["section"] = result.section
+                if result.reranker_score:
+                    chunk_info["reranker_score"] = result.reranker_score
+                
+                sources_by_doc[doc_name]["chunks"].append(chunk_info)
+            
+            state["sources"] = list(sources_by_doc.values())
+            state["metadata"]["unique_sources"] = len(sources_by_doc)
+            
+            return state
+            
+        except Exception as e:
+            state["error"] = f"Source extraction error: {str(e)}"
+            return state
+    
+    def _handle_error(self, state: UnifiedAgentState) -> UnifiedAgentState:
+        """Handle errors gracefully"""
+        
+        error = state.get("error", "Unknown error")
+        state["answer"] = f"I encountered an error: {error}. Please try rephrasing your question or contact support."
+        state["sources"] = []
+        
+        return state
+    
+    # ========== Public Methods ==========
+    
+    def ask(
+        self,
+        question: str,
+        document_types: Optional[List[str]] = None,
+        document_names: Optional[List[str]] = None,
+        chat_history: Optional[List[Dict]] = None
+    ) -> Dict:
+        """
+        Ask a question and get an answer
+        
+        Args:
+            question: User question
+            document_types: Filter by document types (optional)
+            document_names: Filter by document names (optional)
+            chat_history: Previous conversation history (optional)
+            
+        Returns:
+            Dict with answer, sources, and metadata
+        """
+        
+        # Prepare filters
+        document_filters = {}
+        if document_types:
+            document_filters["types"] = document_types
+        if document_names:
+            document_filters["names"] = document_names
+        
+        # Prepare initial state
+        initial_state = {
+            "question": question,
+            "chat_history": chat_history or [],
+            "document_filters": document_filters if document_filters else None,
+            "retrieved_documents": [],
+            "context": "",
+            "answer": "",
+            "sources": [],
+            "metadata": {},
+            "error": None
+        }
+        
+        # Run the graph
+        try:
+            final_state = self.graph.invoke(initial_state)
+            
+            return {
+                "question": question,
+                "answer": final_state["answer"],
+                "sources": final_state["sources"],
+                "metadata": final_state["metadata"],
+                "retrieved_count": len(final_state["retrieved_documents"]),
+                "error": final_state.get("error")
+            }
+            
+        except Exception as e:
+            return {
+                "question": question,
+                "answer": f"An error occurred: {str(e)}",
+                "sources": [],
+                "metadata": {},
+                "retrieved_count": 0,
+                "error": str(e)
+            }
+    
+    def ask_with_conversation(
+        self,
+        question: str,
+        conversation_history: List[Dict],
+        document_types: Optional[List[str]] = None
+    ) -> Dict:
+        """
+        Ask a question with conversation history
+        
+        Args:
+            question: Current question
+            conversation_history: List of {"role": "user"/"assistant", "content": "..."}
+            document_types: Optional document type filter
+            
+        Returns:
+            Dict with answer and sources
+        """
+        
+        return self.ask(
+            question=question,
+            document_types=document_types,
+            chat_history=conversation_history
+        )
+    
+    def multi_document_query(
+        self,
+        question: str,
+        chat_history: Optional[List[Dict]] = None
+    ) -> Dict:
+        """
+        Query across all documents without filters
+        
+        Args:
+            question: User question
+            chat_history: Optional conversation history
+            
+        Returns:
+            Dict with answer from multiple sources
+        """
+        
+        return self.ask(
+            question=question,
+            chat_history=chat_history
+        )
+    
+    def faq_query(
+        self,
+        question: str,
+        chat_history: Optional[List[Dict]] = None
+    ) -> Dict:
+        """
+        Query specifically in FAQ documents
+        
+        Args:
+            question: User question
+            chat_history: Optional conversation history
+            
+        Returns:
+            Dict with FAQ answer
+        """
+        
+        return self.ask(
+            question=question,
+            document_types=["FAQ Document"],
+            chat_history=chat_history
+        )
+    
+    def policy_query(
+        self,
+        question: str,
+        chat_history: Optional[List[Dict]] = None
+    ) -> Dict:
+        """
+        Query in policy documents only
+        
+        Args:
+            question: User question
+            chat_history: Optional conversation history
+            
+        Returns:
+            Dict with policy answer
+        """
+        
+        return self.ask(
+            question=question,
+            document_types=["Product Program Policy", "Product Policy"],
+            chat_history=chat_history
+        )
+    
+    def get_available_documents(self) -> List[Dict]:
+        """Get list of all available documents in the index"""
+        return self.retriever.get_all_documents()
+    
+    def get_document_types(self) -> List[str]:
+        """Get list of all document types in the index"""
+        return self.retriever.get_document_types()
+    
+    def get_index_stats(self) -> Dict:
+        """Get index statistics"""
+        return self.retriever.get_index_statistics()
+
+
+# ========== Utility Functions ==========
+
+def print_response(response: Dict, show_sources: bool = True):
+    """Pretty print agent response"""
+    
+    print("\n" + "="*70)
+    print("QUESTION")
+    print("="*70)
+    print(response["question"])
+    
+    print("\n" + "="*70)
+    print("ANSWER")
+    print("="*70)
+    print(response["answer"])
+    
+    if show_sources and response.get("sources"):
+        print("\n" + "="*70)
+        print(f"SOURCES ({response.get('retrieved_count', 0)} chunks from {len(response['sources'])} documents)")
+        print("="*70)
+        
+        for idx, source in enumerate(response["sources"], 1):
+            print(f"\n[{idx}] {source['document_name']} ({source['document_type']})")
+            print(f"    Chunks used: {len(source['chunks'])}")
+            
+            # Show first chunk preview
+            if source['chunks']:
+                first_chunk = source['chunks'][0]
+                print(f"    Preview: {first_chunk['content'][:100]}...")
+                if 'page' in first_chunk:
+                    print(f"    Page: {first_chunk['page']}")
+    
+    if response.get("metadata"):
+        print("\n" + "="*70)
+        print("METADATA")
+        print("="*70)
+        metadata = response["metadata"]
+        print(f"Retrieved: {metadata.get('retrieved_count', 0)} chunks")
+        print(f"Context length: {metadata.get('context_length', 0)} chars")
+        print(f"Answer length: {metadata.get('answer_length', 0)} chars")
+        if metadata.get('document_types_found'):
+            print(f"Document types: {', '.join(metadata['document_types_found'])}")
+    
+    print("\n" + "="*70 + "\n")
+
+
+def main():
+    """Demo usage of unified RAG agent"""
+    
+    # Configuration - UPDATE THESE
+    CONFIG = {
+        "search_service_endpoint": "https://YOUR_SEARCH_SERVICE.search.windows.net",
+        "search_api_key": "YOUR_SEARCH_API_KEY",
+        "index_name": "policy-index",
+        "openai_api_key": "YOUR_OPENAI_API_KEY",
+        "openai_endpoint": "https://YOUR_OPENAI.openai.azure.com/",
+        "chat_deployment": "gpt-4",
+        "embedding_deployment": "text-embedding-3-large"
+    }
+    
+    if "YOUR_" in CONFIG["search_service_endpoint"]:
+        print("\n❌ Please update CONFIG with your Azure credentials")
+        return
+    
+    # Initialize agent
+    print("\n" + "="*70)
+    print("UNIFIED RAG AGENT - DEMO")
+    print("="*70)
+    
+    agent = UnifiedRAGAgent(**CONFIG)
+    
+    # Get index stats
+    stats = agent.get_index_stats()
+    print(f"\n📊 Index contains {stats.get('unique_documents', 0)} documents")
+    print(f"📑 Document types: {', '.join(stats.get('types', []))}")
+    
+    # Example 1: General query across all documents
+    print("\n" + "#"*70)
+    print("EXAMPLE 1: General Query")
+    print("#"*70)
+    
+    response1 = agent.multi_document_query(
+        question="What is the prime product program eligibility?"
+    )
+    print_response(response1)
+    
+    # Example 2: FAQ-specific query
+    print("\n" + "#"*70)
+    print("EXAMPLE 2: FAQ Query")
+    print("#"*70)
+    
+    response2 = agent.faq_query(
+        question="What should I do if the title deed is missing?"
+    )
+    print_response(response2)
+    
+    # Example 3: Policy-specific query
+    print("\n" + "#"*70)
+    print("EXAMPLE 3: Policy Query")
+    print("#"*70)
+    
+    response3 = agent.policy_query(
+        question="What are the income requirements for affordable products?"
+    )
+    print_response(response3)
+    
+    # Example 4: Query with filters
+    print("\n" + "#"*70)
+    print("EXAMPLE 4: Filtered Query")
+    print("#"*70)
+    
+    response4 = agent.ask(
+        question="How to handle deviations?",
+        document_names=["New Amendments - Deviation Matrix"]
+    )
+    print_response(response4)
+    
+    # Example 5: Conversation with history
+    print("\n" + "#"*70)
+    print("EXAMPLE 5: Conversational Query")
+    print("#"*70)
+    
+    conversation = [
+        {"role": "user", "content": "What is the prime product?"},
+        {"role": "assistant", "content": "The prime product is..."}
+    ]
+    
+    response5 = agent.ask_with_conversation(
+        question="What are its eligibility criteria?",
+        conversation_history=conversation
+    )
+    print_response(response5)
+    
+    print("\n" + "="*70)
+    print("Demo complete!")
+    print("="*70 + "\n")
+
+
+if __name__ == "__main__":
+    main()
