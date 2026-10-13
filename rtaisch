@@ -1,536 +1,459 @@
-from typing import TypedDict, Annotated, List, Dict, Optional
-from langgraph.graph import StateGraph, END
-from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from unified_retrieval import UnifiedPolicyRetriever, SearchResult
-import operator
-from datetime import datetime
-import json
+import os
+from typing import List, Dict, Optional
+from dataclasses import dataclass
+from azure.search.documents import SearchClient
+from azure.core.credentials import AzureKeyCredential
+from openai import AzureOpenAI
 
 
-# ========== State Definition ==========
-class UnifiedAgentState(TypedDict):
-    """State for the unified RAG agent"""
-    question: str
-    chat_history: Annotated[List[Dict], operator.add]
-    document_filters: Optional[Dict]  # {"types": [...], "names": [...]}
-    retrieved_documents: List[SearchResult]
-    context: str
-    answer: str
-    sources: List[Dict]
-    metadata: Dict
-    error: Optional[str]
+@dataclass
+class SearchResult:
+    """Search result from Azure AI Search"""
+    chunk_id: str
+    document_name: str
+    document_type: str
+    blob_name: str
+    content: str
+    score: float
+    reranker_score: Optional[float] = None
+    captions: Optional[List[str]] = None
+    page_number: Optional[int] = None
+    section: Optional[str] = None
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary"""
+        return {
+            "chunk_id": self.chunk_id,
+            "document_name": self.document_name,
+            "document_type": self.document_type,
+            "blob_name": self.blob_name,
+            "content": self.content,
+            "score": self.score,
+            "reranker_score": self.reranker_score,
+            "captions": self.captions,
+            "page_number": self.page_number,
+            "section": self.section
+        }
 
 
-# ========== Unified RAG Agent Class ==========
-class UnifiedRAGAgent:
+class UnifiedPolicyRetriever:
     """
-    LangGraph-based RAG Agent for unified policy document Q&A
-    Searches across all 8 documents with optional filtering
+    Unified retrieval for all policy documents in a single index
+    Supports filtering by document type, hybrid search, and semantic ranking
     """
     
     def __init__(
         self,
         search_service_endpoint: str,
         search_api_key: str,
+        index_name: str,
         openai_api_key: str,
         openai_endpoint: str,
-        index_name: str = "policy-index",
-        embedding_deployment: str = "text-embedding-3-large",
-        chat_deployment: str = "gpt-4",
-        temperature: float = 0.7,
-        max_tokens: int = 1500
+        openai_api_version: str = "2024-02-15-preview",
+        embedding_deployment: str = "text-embedding-3-large"
     ):
         """
-        Initialize Unified RAG Agent
+        Initialize unified retriever
         
         Args:
             search_service_endpoint: Azure AI Search endpoint
             search_api_key: Azure AI Search API key
+            index_name: Name of the search index
             openai_api_key: Azure OpenAI API key
             openai_endpoint: Azure OpenAI endpoint
-            index_name: Search index name (default: policy-index)
-            embedding_deployment: Embedding model deployment
-            chat_deployment: Chat model deployment
-            temperature: LLM temperature
-            max_tokens: Max tokens for response
+            openai_api_version: API version
+            embedding_deployment: Embedding model deployment name
         """
-        # Initialize unified retriever
-        self.retriever = UnifiedPolicyRetriever(
-            search_service_endpoint=search_service_endpoint,
-            search_api_key=search_api_key,
+        self.search_client = SearchClient(
+            endpoint=search_service_endpoint,
             index_name=index_name,
-            openai_api_key=openai_api_key,
-            openai_endpoint=openai_endpoint,
-            embedding_deployment=embedding_deployment
+            credential=AzureKeyCredential(search_api_key)
         )
         
-        # Initialize chat model
-        self.llm = AzureChatOpenAI(
+        self.openai_client = AzureOpenAI(
             api_key=openai_api_key,
-            azure_endpoint=openai_endpoint,
-            deployment_name=chat_deployment,
-            api_version="2024-02-15-preview",
-            temperature=temperature,
-            max_tokens=max_tokens
+            api_version=openai_api_version,
+            azure_endpoint=openai_endpoint
         )
         
+        self.embedding_deployment = embedding_deployment
         self.index_name = index_name
-        self.max_tokens = max_tokens
         
-        # Build the graph
-        self.graph = self._build_graph()
-        
-        print(f"✓ Unified RAG Agent initialized for index: {index_name}")
+        print(f"✓ Unified retriever initialized for index: {index_name}")
     
-    def _build_graph(self) -> StateGraph:
-        """Build the LangGraph workflow"""
-        
-        workflow = StateGraph(UnifiedAgentState)
-        
-        # Add nodes
-        workflow.add_node("analyze_question", self._analyze_question)
-        workflow.add_node("retrieve_documents", self._retrieve_documents)
-        workflow.add_node("format_context", self._format_context)
-        workflow.add_node("generate_answer", self._generate_answer)
-        workflow.add_node("extract_sources", self._extract_sources)
-        workflow.add_node("handle_error", self._handle_error)
-        
-        # Set entry point
-        workflow.set_entry_point("analyze_question")
-        
-        # Add edges
-        workflow.add_edge("analyze_question", "retrieve_documents")
-        workflow.add_edge("retrieve_documents", "format_context")
-        workflow.add_edge("format_context", "generate_answer")
-        workflow.add_edge("generate_answer", "extract_sources")
-        workflow.add_edge("extract_sources", END)
-        workflow.add_edge("handle_error", END)
-        
-        return workflow.compile()
-    
-    # ========== Node Functions ==========
-    
-    def _analyze_question(self, state: UnifiedAgentState) -> UnifiedAgentState:
-        """Analyze the question and prepare for retrieval"""
-        
-        question = state["question"]
-        
-        # Add metadata
-        state["metadata"] = {
-            "timestamp": datetime.now().isoformat(),
-            "question_length": len(question),
-            "has_filters": state.get("document_filters") is not None
-        }
-        
-        return state
-    
-    def _retrieve_documents(self, state: UnifiedAgentState) -> UnifiedAgentState:
-        """Retrieve relevant documents using unified retriever"""
-        
+    def generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding for text using Azure OpenAI"""
         try:
-            question = state["question"]
-            filters = state.get("document_filters", {})
-            
-            # Extract filters
-            document_types = filters.get("types")
-            document_names = filters.get("names")
-            
-            # Perform hybrid search
-            results = self.retriever.hybrid_search(
-                query=question,
-                top_k=10,
-                document_types=document_types,
-                document_names=document_names,
-                use_semantic_ranking=False,  # Disabled by default (requires index configuration)
-                min_score=0.5
+            response = self.openai_client.embeddings.create(
+                input=text,
+                model=self.embedding_deployment
             )
-            
-            state["retrieved_documents"] = results
-            state["metadata"]["retrieved_count"] = len(results)
-            
-            # Log retrieval
-            if results:
-                doc_types = set(r.document_type for r in results)
-                state["metadata"]["document_types_found"] = list(doc_types)
-            
-            return state
-            
+            return response.data[0].embedding
         except Exception as e:
-            state["error"] = f"Retrieval error: {str(e)}"
-            return state
+            print(f"Error generating embedding: {str(e)}")
+            return []
     
-    def _format_context(self, state: UnifiedAgentState) -> UnifiedAgentState:
-        """Format retrieved documents into context"""
-        
-        try:
-            results = state["retrieved_documents"]
-            
-            if not results:
-                state["context"] = "No relevant documents found."
-                return state
-            
-            # Group by document for better organization
-            context_parts = []
-            current_doc = None
-            
-            for idx, result in enumerate(results, 1):
-                # Add document header if changed
-                if result.document_name != current_doc:
-                    current_doc = result.document_name
-                    context_parts.append(f"\n--- {result.document_name} ({result.document_type}) ---\n")
-                
-                # Add content with metadata
-                context_parts.append(f"[{idx}] {result.content}")
-                
-                if result.page_number:
-                    context_parts.append(f" [Page {result.page_number}]")
-                if result.section:
-                    context_parts.append(f" [Section: {result.section}]")
-                
-                context_parts.append("\n\n")
-            
-            state["context"] = "".join(context_parts)
-            state["metadata"]["context_length"] = len(state["context"])
-            
-            return state
-            
-        except Exception as e:
-            state["error"] = f"Context formatting error: {str(e)}"
-            return state
-    
-    def _generate_answer(self, state: UnifiedAgentState) -> UnifiedAgentState:
-        """Generate answer using LLM with retrieved context"""
-        
-        try:
-            question = state["question"]
-            context = state["context"]
-            chat_history = state.get("chat_history", [])
-            
-            # Build system message
-            system_message = SystemMessage(content="""You are a helpful assistant for policy and documentation queries.
-
-Your role:
-- Answer questions based ONLY on the provided context
-- Cite specific documents and sections when possible
-- If the context doesn't contain the answer, say so clearly
-- For FAQ questions, provide both the answer and any mitigation steps mentioned
-- Be concise but complete
-- Use bullet points for multiple items
-- Always cite your sources with document names
-
-Context provided includes documents from:
-- Product program policies (Prime, Affordable)
-- Product policies (Informal)
-- Matrices (Deviation, Credit Approval)
-- Reporting policies (CIC)
-- FAQ documents
-- Guidelines (Mitigation)
-
-Answer format:
-1. Direct answer to the question
-2. Supporting details from context
-3. Sources: [Document names]
-
-If multiple documents contain relevant information, synthesize them into a cohesive answer.""")
-            
-            # Build message history
-            messages = [system_message]
-            
-            # Add chat history (last 5 exchanges)
-            for msg in chat_history[-10:]:
-                if msg["role"] == "user":
-                    messages.append(HumanMessage(content=msg["content"]))
-                elif msg["role"] == "assistant":
-                    messages.append(AIMessage(content=msg["content"]))
-            
-            # Add current question with context
-            user_message = f"""Context from relevant documents:
-
-{context}
-
-Question: {question}
-
-Please answer based on the context above."""
-            
-            messages.append(HumanMessage(content=user_message))
-            
-            # Generate response
-            response = self.llm.invoke(messages)
-            
-            state["answer"] = response.content
-            state["metadata"]["answer_length"] = len(response.content)
-            
-            return state
-            
-        except Exception as e:
-            state["error"] = f"Answer generation error: {str(e)}"
-            return state
-    
-    def _extract_sources(self, state: UnifiedAgentState) -> UnifiedAgentState:
-        """Extract and format source citations"""
-        
-        try:
-            results = state["retrieved_documents"]
-            
-            # Group sources by document
-            sources_by_doc = {}
-            for result in results:
-                doc_name = result.document_name
-                if doc_name not in sources_by_doc:
-                    sources_by_doc[doc_name] = {
-                        "document_name": doc_name,
-                        "document_type": result.document_type,
-                        "blob_name": result.blob_name,
-                        "chunks": []
-                    }
-                
-                chunk_info = {
-                    "content": result.content[:200] + "..." if len(result.content) > 200 else result.content,
-                    "score": result.score
-                }
-                
-                if result.page_number:
-                    chunk_info["page"] = result.page_number
-                if result.section:
-                    chunk_info["section"] = result.section
-                if result.reranker_score:
-                    chunk_info["reranker_score"] = result.reranker_score
-                
-                sources_by_doc[doc_name]["chunks"].append(chunk_info)
-            
-            state["sources"] = list(sources_by_doc.values())
-            state["metadata"]["unique_sources"] = len(sources_by_doc)
-            
-            return state
-            
-        except Exception as e:
-            state["error"] = f"Source extraction error: {str(e)}"
-            return state
-    
-    def _handle_error(self, state: UnifiedAgentState) -> UnifiedAgentState:
-        """Handle errors gracefully"""
-        
-        error = state.get("error", "Unknown error")
-        state["answer"] = f"I encountered an error: {error}. Please try rephrasing your question or contact support."
-        state["sources"] = []
-        
-        return state
-    
-    # ========== Public Methods ==========
-    
-    def ask(
+    def hybrid_search(
         self,
-        question: str,
+        query: str,
+        top_k: int = 10,
         document_types: Optional[List[str]] = None,
         document_names: Optional[List[str]] = None,
-        chat_history: Optional[List[Dict]] = None
-    ) -> Dict:
+        use_semantic_ranking: bool = False,  # Changed default to False
+        min_score: float = 0.0
+    ) -> List[SearchResult]:
         """
-        Ask a question and get an answer
+        Hybrid search across all documents with optional filtering
         
         Args:
-            question: User question
-            document_types: Filter by document types (optional)
-            document_names: Filter by document names (optional)
-            chat_history: Previous conversation history (optional)
+            query: Search query
+            top_k: Number of results to return
+            document_types: Filter by document types (e.g., ["Product Program Policy", "FAQ Document"])
+            document_names: Filter by specific document names
+            use_semantic_ranking: Use semantic L2 ranker
+            min_score: Minimum score threshold
             
         Returns:
-            Dict with answer, sources, and metadata
+            List of SearchResult objects
         """
+        print(f"\n🔍 Hybrid Search: '{query}'")
         
-        # Prepare filters
-        document_filters = {}
+        # Generate query embedding
+        query_vector = self.generate_embedding(query)
+        
+        if not query_vector:
+            print("❌ Failed to generate query embedding")
+            return []
+        
+        # Build filter expression
+        filters = []
         if document_types:
-            document_filters["types"] = document_types
+            type_filters = " or ".join([f"document_type eq '{dt}'" for dt in document_types])
+            filters.append(f"({type_filters})")
+        
         if document_names:
-            document_filters["names"] = document_names
+            name_filters = " or ".join([f"document_name eq '{dn}'" for dn in document_names])
+            filters.append(f"({name_filters})")
         
-        # Prepare initial state
-        initial_state = {
-            "question": question,
-            "chat_history": chat_history or [],
-            "document_filters": document_filters if document_filters else None,
-            "retrieved_documents": [],
-            "context": "",
-            "answer": "",
-            "sources": [],
-            "metadata": {},
-            "error": None
-        }
+        filter_expression = " and ".join(filters) if filters else None
         
-        # Run the graph
+        if filter_expression:
+            print(f"📋 Filters: {filter_expression}")
+        
+        # Perform hybrid search
         try:
-            final_state = self.graph.invoke(initial_state)
-            
-            return {
-                "question": question,
-                "answer": final_state["answer"],
-                "sources": final_state["sources"],
-                "metadata": final_state["metadata"],
-                "retrieved_count": len(final_state["retrieved_documents"]),
-                "error": final_state.get("error")
+            search_params = {
+                "search_text": query,
+                "vector_queries": [{
+                    "kind": "vector",
+                    "vector": query_vector,
+                    "fields": "content_vector",
+                    "k": top_k
+                }],
+                "filter": filter_expression,
+                "select": ["chunk_id", "document_name", "document_type", 
+                          "content", "page_number", "section"],
+                "top": top_k,
+                "query_type": "simple"
             }
+            
+            # Only add semantic ranking if explicitly requested
+            # Note: Requires semantic configuration in the index
+            if use_semantic_ranking:
+                search_params["query_type"] = "semantic"
+                search_params["semantic_configuration_name"] = "default-semantic-config"
+                search_params["query_caption"] = "extractive"
+            
+            search_results = self.search_client.search(**search_params)
+            
+            results = []
+            for result in search_results:
+                # Get score
+                score = result.get("@search.score", 0.0)
+                reranker_score = result.get("@search.reranker_score")
+                
+                # Skip low-score results
+                if score < min_score:
+                    continue
+                
+                # Extract captions if available
+                captions = []
+                if hasattr(result, '@search.captions'):
+                    for caption in result['@search.captions']:
+                        captions.append(caption.text)
+                
+                search_result = SearchResult(
+                    chunk_id=result.get("chunk_id", ""),
+                    document_name=result.get("document_name", ""),
+                    document_type=result.get("document_type", ""),
+                    blob_name=result.get("blob_name", "N/A"),
+                    content=result.get("content", ""),
+                    score=score,
+                    reranker_score=reranker_score,
+                    captions=captions if captions else None,
+                    page_number=result.get("page_number"),
+                    section=result.get("section")
+                )
+                
+                results.append(search_result)
+            
+            print(f"✓ Found {len(results)} results")
+            return results
             
         except Exception as e:
-            return {
-                "question": question,
-                "answer": f"An error occurred: {str(e)}",
-                "sources": [],
-                "metadata": {},
-                "retrieved_count": 0,
-                "error": str(e)
-            }
+            print(f"❌ Search error: {str(e)}")
+            return []
     
-    def ask_with_conversation(
+    def search_by_document_type(
         self,
-        question: str,
-        conversation_history: List[Dict],
+        query: str,
+        document_type: str,
+        top_k: int = 5
+    ) -> List[SearchResult]:
+        """
+        Search within specific document type
+        
+        Args:
+            query: Search query
+            document_type: Type of document (e.g., "FAQ Document", "Product Program Policy")
+            top_k: Number of results
+            
+        Returns:
+            List of SearchResult objects
+        """
+        print(f"\n📑 Searching in: {document_type}")
+        return self.hybrid_search(
+            query=query,
+            top_k=top_k,
+            document_types=[document_type]
+        )
+    
+    def search_specific_documents(
+        self,
+        query: str,
+        document_names: List[str],
+        top_k: int = 5
+    ) -> List[SearchResult]:
+        """
+        Search within specific documents
+        
+        Args:
+            query: Search query
+            document_names: List of document names to search in
+            top_k: Number of results
+            
+        Returns:
+            List of SearchResult objects
+        """
+        print(f"\n📄 Searching in documents: {', '.join(document_names)}")
+        return self.hybrid_search(
+            query=query,
+            top_k=top_k,
+            document_names=document_names
+        )
+    
+    def multi_document_search(
+        self,
+        query: str,
+        top_k_per_type: int = 3
+    ) -> Dict[str, List[SearchResult]]:
+        """
+        Search across all document types and return results grouped by type
+        
+        Args:
+            query: Search query
+            top_k_per_type: Number of results per document type
+            
+        Returns:
+            Dictionary mapping document types to search results
+        """
+        print(f"\n🔍 Multi-document search: '{query}'")
+        
+        # Get all unique document types
+        document_types = self.get_document_types()
+        
+        results_by_type = {}
+        
+        for doc_type in document_types:
+            results = self.search_by_document_type(query, doc_type, top_k_per_type)
+            if results:
+                results_by_type[doc_type] = results
+        
+        print(f"\n✓ Found results in {len(results_by_type)} document types")
+        return results_by_type
+    
+    def keyword_search(
+        self,
+        query: str,
+        top_k: int = 10,
         document_types: Optional[List[str]] = None
-    ) -> Dict:
+    ) -> List[SearchResult]:
         """
-        Ask a question with conversation history
+        Keyword-only search (no vector)
         
         Args:
-            question: Current question
-            conversation_history: List of {"role": "user"/"assistant", "content": "..."}
-            document_types: Optional document type filter
+            query: Search query
+            top_k: Number of results
+            document_types: Optional filter by document types
             
         Returns:
-            Dict with answer and sources
+            List of SearchResult objects
         """
+        print(f"\n🔤 Keyword Search: '{query}'")
         
-        return self.ask(
-            question=question,
-            document_types=document_types,
-            chat_history=conversation_history
-        )
-    
-    def multi_document_query(
-        self,
-        question: str,
-        chat_history: Optional[List[Dict]] = None
-    ) -> Dict:
-        """
-        Query across all documents without filters
+        filter_expression = None
+        if document_types:
+            type_filters = " or ".join([f"document_type eq '{dt}'" for dt in document_types])
+            filter_expression = f"({type_filters})"
         
-        Args:
-            question: User question
-            chat_history: Optional conversation history
+        try:
+            search_results = self.search_client.search(
+                search_text=query,
+                filter=filter_expression,
+                select=["chunk_id", "document_name", "document_type",
+                       "content", "page_number", "section"],
+                top=top_k
+            )
             
-        Returns:
-            Dict with answer from multiple sources
-        """
-        
-        return self.ask(
-            question=question,
-            chat_history=chat_history
-        )
-    
-    def faq_query(
-        self,
-        question: str,
-        chat_history: Optional[List[Dict]] = None
-    ) -> Dict:
-        """
-        Query specifically in FAQ documents
-        
-        Args:
-            question: User question
-            chat_history: Optional conversation history
+            results = []
+            for result in search_results:
+                search_result = SearchResult(
+                    chunk_id=result.get("chunk_id", ""),
+                    document_name=result.get("document_name", ""),
+                    document_type=result.get("document_type", ""),
+                    blob_name=result.get("blob_name", "N/A"),
+                    content=result.get("content", ""),
+                    score=result.get("@search.score", 0.0),
+                    page_number=result.get("page_number"),
+                    section=result.get("section")
+                )
+                results.append(search_result)
             
-        Returns:
-            Dict with FAQ answer
-        """
-        
-        return self.ask(
-            question=question,
-            document_types=["FAQ Document"],
-            chat_history=chat_history
-        )
-    
-    def policy_query(
-        self,
-        question: str,
-        chat_history: Optional[List[Dict]] = None
-    ) -> Dict:
-        """
-        Query in policy documents only
-        
-        Args:
-            question: User question
-            chat_history: Optional conversation history
+            print(f"✓ Found {len(results)} results")
+            return results
             
-        Returns:
-            Dict with policy answer
-        """
-        
-        return self.ask(
-            question=question,
-            document_types=["Product Program Policy", "Product Policy"],
-            chat_history=chat_history
-        )
-    
-    def get_available_documents(self) -> List[Dict]:
-        """Get list of all available documents in the index"""
-        return self.retriever.get_all_documents()
+        except Exception as e:
+            print(f"❌ Search error: {str(e)}")
+            return []
     
     def get_document_types(self) -> List[str]:
-        """Get list of all document types in the index"""
-        return self.retriever.get_document_types()
-    
-    def get_index_stats(self) -> Dict:
-        """Get index statistics"""
-        return self.retriever.get_index_statistics()
-
-
-# ========== Utility Functions ==========
-
-def print_response(response: Dict, show_sources: bool = True):
-    """Pretty print agent response"""
-    
-    print("\n" + "="*70)
-    print("QUESTION")
-    print("="*70)
-    print(response["question"])
-    
-    print("\n" + "="*70)
-    print("ANSWER")
-    print("="*70)
-    print(response["answer"])
-    
-    if show_sources and response.get("sources"):
-        print("\n" + "="*70)
-        print(f"SOURCES ({response.get('retrieved_count', 0)} chunks from {len(response['sources'])} documents)")
-        print("="*70)
-        
-        for idx, source in enumerate(response["sources"], 1):
-            print(f"\n[{idx}] {source['document_name']} ({source['document_type']})")
-            print(f"    Chunks used: {len(source['chunks'])}")
+        """Get all unique document types in the index"""
+        try:
+            # Use facets to get unique document types
+            results = self.search_client.search(
+                search_text="*",
+                facets=["document_type"],
+                top=0
+            )
             
-            # Show first chunk preview
-            if source['chunks']:
-                first_chunk = source['chunks'][0]
-                print(f"    Preview: {first_chunk['content'][:100]}...")
-                if 'page' in first_chunk:
-                    print(f"    Page: {first_chunk['page']}")
+            doc_types = []
+            if hasattr(results, 'get_facets'):
+                facets = results.get_facets()
+                if facets and "document_type" in facets:
+                    doc_types = [facet["value"] for facet in facets["document_type"]]
+            
+            return doc_types
+            
+        except Exception as e:
+            print(f"Error getting document types: {str(e)}")
+            return []
     
-    if response.get("metadata"):
-        print("\n" + "="*70)
-        print("METADATA")
-        print("="*70)
-        metadata = response["metadata"]
-        print(f"Retrieved: {metadata.get('retrieved_count', 0)} chunks")
-        print(f"Context length: {metadata.get('context_length', 0)} chars")
-        print(f"Answer length: {metadata.get('answer_length', 0)} chars")
-        if metadata.get('document_types_found'):
-            print(f"Document types: {', '.join(metadata['document_types_found'])}")
+    def get_all_documents(self) -> List[Dict]:
+        """Get list of all documents in the index"""
+        try:
+            results = self.search_client.search(
+                search_text="*",
+                select=["document_name", "document_type"],
+                top=100
+            )
+            
+            documents = []
+            seen = set()
+            
+            for result in results:
+                doc_name = result.get("document_name", "")
+                if doc_name and doc_name not in seen:
+                    documents.append({
+                        "document_name": doc_name,
+                        "document_type": result.get("document_type", "")
+                    })
+                    seen.add(doc_name)
+            
+            return documents
+            
+        except Exception as e:
+            print(f"Error getting documents: {str(e)}")
+            return []
     
-    print("\n" + "="*70 + "\n")
+    def get_index_statistics(self) -> Dict:
+        """Get statistics about the index"""
+        try:
+            # Get document count using search
+            results = self.search_client.search(
+                search_text="*",
+                include_total_count=True,
+                top=0
+            )
+            
+            total_count = results.get_count() if hasattr(results, 'get_count') else 0
+            
+            # Get unique documents
+            documents = self.get_all_documents()
+            document_types = self.get_document_types()
+            
+            stats = {
+                "index_name": self.index_name,
+                "total_chunks": total_count,
+                "unique_documents": len(documents),
+                "document_types": len(document_types),
+                "documents": documents,
+                "types": document_types
+            }
+            
+            return stats
+            
+        except Exception as e:
+            print(f"Error getting statistics: {str(e)}")
+            return {}
+
+
+def print_search_results(results: List[SearchResult], show_full_text: bool = False):
+    """Print search results in a formatted way"""
+    
+    if not results:
+        print("\n❌ No results found")
+        return
+    
+    print(f"\n{'='*70}")
+    print(f"SEARCH RESULTS ({len(results)} found)")
+    print(f"{'='*70}\n")
+    
+    for idx, result in enumerate(results, 1):
+        print(f"[{idx}] {result.document_name}")
+        print(f"    Type: {result.document_type}")
+        print(f"    Score: {result.score:.4f}", end="")
+        if result.reranker_score:
+            print(f" | Reranker: {result.reranker_score:.4f}", end="")
+        print()
+        
+        if result.page_number:
+            print(f"    Page: {result.page_number}")
+        if result.section:
+            print(f"    Section: {result.section}")
+        
+        # Show captions if available
+        if result.captions:
+            print(f"    Caption: {result.captions[0][:150]}...")
+        elif show_full_text:
+            print(f"    Content: {result.content[:200]}...")
+        else:
+            print(f"    Content: {result.content[:150]}...")
+        
+        print()
 
 
 def main():
-    """Demo usage of unified RAG agent"""
+    """Demo usage of unified retrieval"""
     
     # Configuration - UPDATE THESE
     CONFIG = {
@@ -538,83 +461,75 @@ def main():
         "search_api_key": "YOUR_SEARCH_API_KEY",
         "index_name": "policy-index",
         "openai_api_key": "YOUR_OPENAI_API_KEY",
-        "openai_endpoint": "https://YOUR_OPENAI.openai.azure.com/",
-        "chat_deployment": "gpt-4",
-        "embedding_deployment": "text-embedding-3-large"
+        "openai_endpoint": "https://YOUR_OPENAI.openai.azure.com/"
     }
     
     if "YOUR_" in CONFIG["search_service_endpoint"]:
         print("\n❌ Please update CONFIG with your Azure credentials")
         return
     
-    # Initialize agent
+    # Initialize retriever
     print("\n" + "="*70)
-    print("UNIFIED RAG AGENT - DEMO")
+    print("UNIFIED POLICY DOCUMENT RETRIEVAL")
     print("="*70)
     
-    agent = UnifiedRAGAgent(**CONFIG)
+    retriever = UnifiedPolicyRetriever(**CONFIG)
     
-    # Get index stats
-    stats = agent.get_index_stats()
-    print(f"\n📊 Index contains {stats.get('unique_documents', 0)} documents")
-    print(f"📑 Document types: {', '.join(stats.get('types', []))}")
+    # Get index statistics
+    print("\n📊 Index Statistics:")
+    stats = retriever.get_index_statistics()
+    print(f"   Total chunks: {stats.get('total_chunks', 0)}")
+    print(f"   Unique documents: {stats.get('unique_documents', 0)}")
+    print(f"   Document types: {stats.get('document_types', 0)}")
     
-    # Example 1: General query across all documents
-    print("\n" + "#"*70)
-    print("EXAMPLE 1: General Query")
-    print("#"*70)
+    if stats.get('documents'):
+        print("\n📄 Documents in index:")
+        for doc in stats['documents'][:10]:
+            print(f"   - {doc['document_name']} ({doc['document_type']})")
     
-    response1 = agent.multi_document_query(
-        question="What is the prime product program eligibility?"
+    # Example 1: General hybrid search
+    print("\n" + "="*70)
+    print("EXAMPLE 1: General Hybrid Search")
+    print("="*70)
+    results = retriever.hybrid_search(
+        query="What is the prime product program?",
+        top_k=5
     )
-    print_response(response1)
+    print_search_results(results)
     
-    # Example 2: FAQ-specific query
-    print("\n" + "#"*70)
-    print("EXAMPLE 2: FAQ Query")
-    print("#"*70)
-    
-    response2 = agent.faq_query(
-        question="What should I do if the title deed is missing?"
+    # Example 2: Search in FAQ only
+    print("\n" + "="*70)
+    print("EXAMPLE 2: Search in FAQ Documents")
+    print("="*70)
+    results = retriever.search_by_document_type(
+        query="What if title deed is missing?",
+        document_type="FAQ Document",
+        top_k=3
     )
-    print_response(response2)
+    print_search_results(results)
     
-    # Example 3: Policy-specific query
-    print("\n" + "#"*70)
-    print("EXAMPLE 3: Policy Query")
-    print("#"*70)
-    
-    response3 = agent.policy_query(
-        question="What are the income requirements for affordable products?"
+    # Example 3: Search in specific documents
+    print("\n" + "="*70)
+    print("EXAMPLE 3: Search Specific Documents")
+    print("="*70)
+    results = retriever.search_specific_documents(
+        query="credit approval",
+        document_names=["Credit Approval Authorization Matrix", "HFC-RK-PD-03 CIC Reporting"],
+        top_k=3
     )
-    print_response(response3)
+    print_search_results(results)
     
-    # Example 4: Query with filters
-    print("\n" + "#"*70)
-    print("EXAMPLE 4: Filtered Query")
-    print("#"*70)
-    
-    response4 = agent.ask(
-        question="How to handle deviations?",
-        document_names=["New Amendments - Deviation Matrix"]
+    # Example 4: Multi-document search
+    print("\n" + "="*70)
+    print("EXAMPLE 4: Multi-Document Search")
+    print("="*70)
+    results_by_type = retriever.multi_document_search(
+        query="deviation matrix",
+        top_k_per_type=2
     )
-    print_response(response4)
-    
-    # Example 5: Conversation with history
-    print("\n" + "#"*70)
-    print("EXAMPLE 5: Conversational Query")
-    print("#"*70)
-    
-    conversation = [
-        {"role": "user", "content": "What is the prime product?"},
-        {"role": "assistant", "content": "The prime product is..."}
-    ]
-    
-    response5 = agent.ask_with_conversation(
-        question="What are its eligibility criteria?",
-        conversation_history=conversation
-    )
-    print_response(response5)
+    for doc_type, results in results_by_type.items():
+        print(f"\n📑 {doc_type}:")
+        print_search_results(results)
     
     print("\n" + "="*70)
     print("Demo complete!")
